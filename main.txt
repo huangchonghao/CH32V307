@@ -1,0 +1,1253 @@
+/*******************************************************************************
+* WiFi 模块接口测试例程
+* 赤菟开发板上 UART6 连接 WiFi 模块接口，兼容 ESP-01，ESP-01S WiFi 模块
+* 使用时注意 WiFi 天线朝向板外
+* 本例程演示使用 DMA 通过 UART6 与 WiFi 模块通信
+* 例程中 uartWriteWiFi(), uartWriteWiFiStr() 是非阻塞的。
+* 调用这些函数发送时，若上一次发送尚未完成，将不等待而直接返回
+*******************************************************************************/
+#include "string.h"
+#include "debug.h"
+#include "AHT_10.h"
+#include "lcd.h"
+#include "aliyun_mqtt.h"
+#include "pwm.h"
+#include "math.h"
+/* Global define */
+#define RXBUF_SIZE 1024 // DMA buffer size
+#define size(a)   (sizeof(a) / sizeof(*(a)))
+
+#define SET_TOPIC  "/sys/h92l3xW8FIO/DS18820/thing/service/property/set"//订阅
+#define POST_TOPIC "/sys/h92l3xW8FIO/DS18820/thing/event/property/post"//发布
+void UART6_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void USART2_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void BASIC_TIM4_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void TIM2_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));        //舵机转动延时定时器
+
+void EXTI1_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void EXTI2_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void EXTI3_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void EXTI9_5_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+void EXTI15_10_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+//void EXTI0_IRQnHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+extern u8 uart6_rx_buff[1024];//串口1接收数据缓冲区
+extern u16 uart6_cnt;//保存数组下班
+extern u8 uart6_flag;//接收完成标志符
+extern u8 anbody; //判断k210 A11引脚是否有人
+extern u16 FORE_COLOR;
+float temperature, humidity;
+int8_t dir=1;
+int8_t zs=10,pause=4;
+
+void TIM2_IRQHandler(void)
+{
+        if( TIM_GetITStatus(TIM2, TIM_IT_Update) != RESET)
+        {
+            if(dir&(pause>0))
+            {
+                zs=60;
+                pause--;
+                if(pause==0)
+                    dir=0;
+            }
+            else if(!dir&(pause<4))
+            {
+                zs=10;
+                pause=4;
+                dir=1;
+                TIM_Cmd(TIM2,DISABLE);
+            }
+            TIM_SetCompare3(TIM3, zs);
+        }
+        TIM_ClearITPendingBit(TIM2, TIM_IT_Update);
+}
+
+u8 USART_RransportString[]="";
+int i;
+//void EXTI0_IRQnHandler(void)
+//{
+//    //确保是否产生了EXTI Line中断
+//    if(EXTI_GetITStatus(EXTI_Line0) != RESET)
+//    {
+//        print("test");
+//        Delay_Ms(10);
+////        GPIO_ResetBits(GPIOD,GPIO_Pin_8);
+////        GPIO_ResetBits(GPIOD,GPIO_Pin_11);
+//        GPIO_SetBits(GPIOD,GPIO_Pin_8);
+//        GPIO_SetBits(GPIOD,GPIO_Pin_11);
+//    }
+//    EXTI_ClearITPendingBit(EXTI_Line0);
+//}
+
+//void USART2_IRQHandler(void)
+//{
+//    if(USART_GetITStatus(USART2, USART_IT_RXNE) != RESET)
+//    {printf("demo");
+//        USART_ClearITPendingBit(USART2,USART_IT_RXNE);
+//        USART_ReceiveString[Receive_sum] = USART_ReceiveData(USART2);       //通过USART2串口接收字符
+//        Receive_sum++;      //数组下标++
+//        if(USART_ReceiveString[Receive_sum]=='\0')
+//        {
+////            USART_Cmd(USART2,DISABLE);
+//            for(i=0;i<Receive_sum;i++)
+//            {
+//                USART_SendData(USART1,USART_ReceiveString[i]);
+//                while (USART_GetFlagStatus(USART1, USART_FLAG_TXE) == RESET);
+//            }
+//            Receive_sum = 0;
+////            USART_Cmd(USART2,ENABLE);
+//        }
+//    }
+//}
+////char *num = USART_ReceiveData(USART2);
+//void USART2_IRQHandler(void){
+//      unsigned char RxData;
+//      if (USART_GetITStatus(USART2, USART_IT_RXNE) != RESET) {
+//            USART_ClearITPendingBit(USART2, USART_IT_RXNE);
+//            RxData=USART_ReceiveData(USART2);
+//            RxData = RxData + 1;
+//           USART_SendData(USART1,RxData);
+//      }
+//}
+char wendu[]="温度是";
+char shidu[]="湿度是";
+char *data[81]={"零","一","二","三","四","五","六","七","八","九","十","十一","十二","十三","十四","十五","十六","十七","十八","十九","二十","二十一","二十二","二十三","二十四","二十五","二十六","二十七","二十八","二十九","三十","三十一","三十二","三十三","三十四","三十五","三十六","三十七","三十八","三十九","四十",
+                "四十一","四十二","四十三","四十四","四十五","四十六","四十七","四十八","四十九","五十","五十一","五十二","五十三","五十四","五十五","五十六","五十七","五十八","五十九","六十","六十一","六十二","六十三","六十四","六十五","六十六","六十七","六十八","六十九","七十","七十一","七十二","七十三","七十四","七十五","七十六","七十七","七十八","七十九","八十"};
+char sheshidu[]="摄氏度";
+char baifenzhi[]="百分之";
+char ppm_call[]="空气易燃气体过高";
+char shiba[]="18";
+u8 str2[] = "";
+uint16_t tt=0;
+
+int Receive_sum = 0;                                                            //数组下标
+u8 USART_ReceiveString[50];                                                   //接收PC端发送过来的字符
+void USART2_IRQHandler(void)
+{
+//    printf("demo");
+    if(USART_GetITStatus(USART2, USART_IT_RXNE) != RESET)
+    {
+        USART_ClearITPendingBit(USART2,USART_IT_RXNE);
+        USART_ReceiveString[Receive_sum++] = USART_ReceiveData(USART2);       //通过USART2串口接收字符
+//        if(USART_ReceiveString[Receive_sum]!='\0')
+//        {
+//            Receive_sum++;
+//        }
+    }
+/*
+ * demo4
+ */if(strstr(USART_ReceiveString , "湿")> 0)
+ {
+      printf("get 湿度: ");
+         //                                    Usartx_SendData(USART2,shidu,strlen(shidu));
+      printf("%d\r\n",(int)humidity);
+      Usartx_SendData(USART2,shidu,strlen(shidu));
+      Usartx_SendData(USART2,baifenzhi,strlen(baifenzhi));
+      Usartx_SendData(USART2,data[(int)humidity],strlen(data[(int)humidity]));
+      Delay_Ms(1000);
+      Receive_sum = 0;
+         for (unsigned int ii = 0; ii <= strlen(USART_ReceiveString); ii++)
+              USART_ReceiveString[ii]='\0';                     //for循环清空数组
+//      USART_ReceiveString[0]='\0';
+  }
+    if(strstr(USART_ReceiveString , "温")> 0)
+    {
+          printf("get 温度: ");
+            //                            Usartx_SendData(USART2,wendu,strlen(wendu));
+          printf("%d\r\n",(int)temperature);
+          Usartx_SendData(USART2,wendu,strlen(wendu));
+          Usartx_SendData(USART2,data[(int)temperature],strlen(data[(int)temperature]));
+          Usartx_SendData(USART2,sheshidu,strlen(sheshidu));
+          Delay_Ms(1000);
+          Receive_sum = 0;
+          for (unsigned int ii = 0; ii <= strlen(USART_ReceiveString); ii++)
+               USART_ReceiveString[ii]='\0';                     //for循环清空数组
+//          USART_ReceiveString[0]='\0';
+    }
+//    if(strstr(USART_ReceiveString , "湿")> 0)
+//    {
+//         printf("get 湿度: ");
+//            //                                    Usartx_SendData(USART2,shidu,strlen(shidu));
+//         printf("%d\r\n",(int)humidity);
+//         Usartx_SendData(USART2,shidu,strlen(shidu));
+//         Usartx_SendData(USART2,baifenzhi,strlen(baifenzhi));
+//         Usartx_SendData(USART2,data[(int)humidity],strlen(data[(int)humidity]));
+//         Receive_sum = 0;
+////         for (unsigned int ii = 0; ii < strlen(USART_ReceiveString); ii++)
+////              USART_ReceiveString[ii]='\0';                     //for循环清空数组
+//         USART_ReceiveString[0]='\0';
+//     }
+}
+u8 time;
+void Tim4_Init(u16 psc,u16 arr)
+{
+    TIM_TimeBaseInitTypeDef   TIM_TimeBaseInitstructure;
+    NVIC_InitTypeDef NVIC_InitStructure;
+        RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM6,ENABLE);
+
+        TIM_TimeBaseInitstructure.TIM_Period=1000;
+
+
+        TIM_TimeBaseInitstructure.TIM_Prescaler=71;
+
+        TIM_TimeBaseInit(TIM4,&TIM_TimeBaseInitstructure);
+
+        TIM_ClearFlag(TIM4,TIM_FLAG_Update);
+        /*设置时钟中断源为 计数更新中断*/
+        TIM_ITConfig(TIM4,TIM_IT_Update,ENABLE);
+
+          NVIC_PriorityGroupConfig(NVIC_PriorityGroup_0);
+          NVIC_InitStructure.NVIC_IRQChannel = TIM4_IRQn;
+          NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 0;
+
+          NVIC_InitStructure.NVIC_IRQChannelSubPriority = 3;
+
+          NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+
+          NVIC_Init(&NVIC_InitStructure);
+}
+void BASIC_TIM4_IRQHandler()
+{
+    if(TIM_GetITStatus(TIM4,TIM_IT_Update)!=RESET)
+    {
+        time--;
+        TIM_ClearITPendingBit(TIM4,TIM_IT_Update);
+    }
+}
+void  base_time_delay_ms(u16 t)
+{
+    time=t;
+    TIM_Cmd(TIM4,ENABLE);
+    while(time!=0);
+    if(time==0)
+    {
+        time=t;
+        TIM_Cmd(TIM4,DISABLE);
+    }
+
+}
+
+
+void UART6_IRQHandler(void)
+{
+    u8 c;
+    if(USART_GetITStatus(UART6, USART_IT_RXNE) != RESET)
+    {
+        c=USART_ReceiveData(UART6);
+//      USART1->DR=c;
+        if(uart6_flag==0)//判断上一次数据是否处理完成
+        {
+            if(uart6_cnt<1024)
+            {
+                uart6_rx_buff[uart6_cnt++]=c;
+//                TIM4->CNT=0;//清空计数器值
+//                TIM4->CR1|=1<<0;//开启定时
+                base_time_delay_ms(20);
+            }
+            else uart6_flag=1;
+        }
+    }
+}
+/***
+ * MQTT连接服务端
+ */
+#define WIFI_NAME "chong"
+#define WIFI_PASSWORD "huang098123"
+#define SERVER_IP "h92l3xW8FIO.iot-as-mqtt.cn-shanghai.aliyuncs.com"   //接入域名格式:${YourProductKey}.iot-as-mqtt.${YourRegionId}.aliyuncs.com:1883
+#define SERVER_PORT 1883
+#define ProductKey "h92l3xW8FIO"
+#define DeviceName   "DS18820"//设备名称
+#define DeviceSecret "8305528b51c9c4c03ec3780ffe249293"//设备密码
+
+#define ClientID "DS18820|securemode=3,signmethod=hmacsha1|"        //clientId可自定义，一般我们直接使用三元组中的DeviceName代替；timestamp可不填。
+//#define ClientID "h92l3xW8FIO.DS18820|securemode=2,signmethod=hmacsha256,timestamp=1652716518983|"
+
+#define Username "DS18820&h92l3xW8FIO"                      //用户名中deviceName用三元组中DeviceName代替；productKey用三元组中productKey代替。
+//#define Password "FA88DC400F061B68A3DB92881B44836104C37EE7"//MQTT + timestamp
+//#define Password "FA88DC400F061B68A3DB92881B44836104C37EE7"//h92l3xW8FIO.DS18820|securemode=2,signmethod=hmacsha256,timestamp=1652705200919|
+//#define Password "21465730CCA88618B3123EECD33CE1E3ABE3640D"//MQTT
+//#define Password "FA88DC400F061B68A3DB92881B44836104C37EE7"//DS18820|securemode=3,signmethod=hmacsha1|
+#define Password "4D7BB87D11B7422EB02D951AD909A8325C78D198"//DS18820√√√√√√
+//#define Password "34B92C9C2902E0FC27C0CDEFC752228B867E17CD"//时间戳
+//#define Password "84A2D7919D55528C278F924D63A9F9A655977C63"//时间戳 + DS18820
+//#define Password "2bcf2767951f936f6f1ba45e832d115e715b56fef2b4646b7759e6285e5736c8"//直接在物联网平台获取
+
+/* Global Variable */
+u8 TxBuffer[] = " ";
+u8 RxBuffer[RXBUF_SIZE]={0};
+u8 str1[] = "";
+//u8 RxBuffer2[TxSize2] = {0};   //
+char* itoa(int num,char* str,int radix)
+{
+    char index[]="0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";//索引表
+    unsigned unum;//存放要转换的整数的绝对值,转换的整数可能是负数
+    int i=0,j,k;//i用来指示设置字符串相应位，转换之后i其实就是字符串的长度；转换后顺序是逆序的，有正负的情况，k用来指示调整顺序的开始位置;j用来指示调整顺序时的交换。
+
+    //获取要转换的整数的绝对值
+    if(radix==10&&num<0)//要转换成十进制数并且是负数
+    {
+        unum=(unsigned)-num;//将num的绝对值赋给unum
+        str[i++]='-';//在字符串最前面设置为'-'号，并且索引加1
+    }
+    else unum=(unsigned)num;//若是num为正，直接赋值给unum
+
+    //转换部分，注意转换后是逆序的
+    do
+    {
+        str[i++]=index[unum%(unsigned)radix];//取unum的最后一位，并设置为str对应位，指示索引加1
+        unum/=radix;//unum去掉最后一位
+
+    }while(unum);//直至unum为0退出循环
+
+    str[i]='\0';//在字符串最后添加'\0'字符，c语言字符串以'\0'结束。
+
+    //将顺序调整过来
+    if(str[0]=='-') k=1;//如果是负数，符号不用调整，从符号后面开始调整
+    else k=0;//不是负数，全部都要调整
+
+    char temp;//临时变量，交换两个值时用到
+    for(j=k;j<=(i-1)/2;j++)//头尾一一对称交换，i其实就是字符串的长度，索引最大值比长度少1
+    {
+        temp=str[j];//头部赋值给临时变量
+        str[j]=str[i-1+k-j];//尾部赋值给头部
+        str[i-1+k-j]=temp;//将临时变量的值(其实就是之前的头部值)赋给尾部
+    }
+
+    return str;//返回转换后的字符串
+
+}
+char * strcat(char * dest, const char * src)
+{
+        char *tmp = dest;
+        char *tmp1 = src;
+        while (*dest)
+                dest++;
+        while ((*dest++ = *src++) != '\0')
+                ;
+//        tmp1 = *tmp;
+        return tmp;
+}
+
+
+void USART1_IRQHandler(void) __attribute__((interrupt("WCH-Interrupt-fast")));
+/*******************************************************************************
+* Function Name  : USARTx_CFG
+* Description    : Initializes the USART6 peripheral.
+* 描述    ：   串口初始化
+* Input          : None
+* Return         : None
+*******************************************************************************/
+void USART1_IRQHandler(void)
+{
+//        if(USART_GetITStatus(USART1, USART_IT_RXNE) != RESET)
+//        {
+//            recv = USART_ReceiveData(USART1);
+//            if(recv != 'A')
+//            {
+//                if
+//            }
+//            RxBuffer1[RxCnt1++] = recv;
+//        }
+}
+
+
+
+u16 TxBuf[1024];
+s16 Calibrattion_Val = 0;
+void ADC_Function_Init(void)
+{
+    ADC_InitTypeDef ADC_InitStructure={0};
+    GPIO_InitTypeDef GPIO_InitStructure={0};
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOA, ENABLE );
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_ADC1, ENABLE );
+    RCC_ADCCLKConfig(RCC_PCLK2_Div8);
+
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_1;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AIN;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;   //。。。。。。。。。
+    GPIO_Init(GPIOA, &GPIO_InitStructure);
+
+    ADC_DeInit(ADC1);
+    ADC_InitStructure.ADC_Mode = ADC_Mode_Independent;
+    ADC_InitStructure.ADC_ScanConvMode = DISABLE;
+    ADC_InitStructure.ADC_ContinuousConvMode = ENABLE;
+    ADC_InitStructure.ADC_ExternalTrigConv = ADC_ExternalTrigConv_None;
+    ADC_InitStructure.ADC_DataAlign = ADC_DataAlign_Right;
+    ADC_InitStructure.ADC_NbrOfChannel = 1;
+    ADC_Init(ADC1, &ADC_InitStructure);
+
+    ADC_DMACmd(ADC1, ENABLE);
+    ADC_Cmd(ADC1, ENABLE);
+
+    ADC_BufferCmd(ADC1, DISABLE);   //disable buffer
+    ADC_ResetCalibration(ADC1);
+    while(ADC_GetResetCalibrationStatus(ADC1));
+    ADC_StartCalibration(ADC1);
+    while(ADC_GetCalibrationStatus(ADC1));
+    ADC_SoftwareStartConvCmd(ADC1,ENABLE);                  //启动转换   使能或者失能指定的 ADC 的软件转换启动功能
+    Calibrattion_Val = Get_CalibrationValue(ADC1);
+
+    ADC_BufferCmd(ADC1, ENABLE);   //enable buffer
+}
+u16 Get_ADC_Val(u8 ch)
+{
+    u16 val;
+
+    ADC_RegularChannelConfig(ADC1, ch, 1, ADC_SampleTime_239Cycles5 );
+    ADC_SoftwareStartConvCmd(ADC1, ENABLE);
+
+    while(!ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC ));
+    val = ADC_GetConversionValue(ADC1);
+
+    return val;
+}
+void DMA_Tx_Init( DMA_Channel_TypeDef* DMA_CHx, u32 ppadr, u32 memadr, u16 bufsize)
+{
+    DMA_InitTypeDef DMA_InitStructure={0};
+
+    RCC_AHBPeriphClockCmd( RCC_AHBPeriph_DMA1, ENABLE );
+
+    DMA_DeInit(DMA_CHx);
+    DMA_InitStructure.DMA_PeripheralBaseAddr = ppadr;
+    DMA_InitStructure.DMA_MemoryBaseAddr = memadr;
+    DMA_InitStructure.DMA_DIR = DMA_DIR_PeripheralSRC;
+    DMA_InitStructure.DMA_BufferSize = bufsize;
+    DMA_InitStructure.DMA_PeripheralInc = DMA_PeripheralInc_Disable;
+    DMA_InitStructure.DMA_MemoryInc = DMA_MemoryInc_Enable;
+    DMA_InitStructure.DMA_PeripheralDataSize = DMA_PeripheralDataSize_HalfWord;
+    DMA_InitStructure.DMA_MemoryDataSize = DMA_MemoryDataSize_HalfWord;
+    DMA_InitStructure.DMA_Mode = DMA_Mode_Normal;
+    DMA_InitStructure.DMA_Priority = DMA_Priority_VeryHigh;
+    DMA_InitStructure.DMA_M2M = DMA_M2M_Disable;
+    DMA_Init( DMA_CHx, &DMA_InitStructure );
+}
+u16 Get_ConversionVal(s16 val)
+{
+    if((val+Calibrattion_Val)<0) return 0;
+    if((Calibrattion_Val+val)>4095) return 4095;
+    return (val+Calibrattion_Val);
+}
+
+
+
+
+void USARTx_CFG(void)
+{
+    GPIO_InitTypeDef  GPIO_InitStructure;
+    USART_InitTypeDef USART_InitStructure;
+    NVIC_InitTypeDef  NVIC_InitStructure = {0};//////////////////////////////
+    //开启时钟
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_UART6, ENABLE);
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOC, ENABLE);
+
+    /* USART6 TX-->C0  RX-->C1 */
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_0;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF_PP;
+    GPIO_Init(GPIOC, &GPIO_InitStructure);
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_1;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;           //RX，输入上拉
+    GPIO_Init(GPIOC, &GPIO_InitStructure);
+
+    USART_InitStructure.USART_BaudRate = 115200;                    // 波特率
+    USART_InitStructure.USART_WordLength = USART_WordLength_8b;     // 数据位 8
+    USART_InitStructure.USART_StopBits = USART_StopBits_1;          // 停止位 1
+    USART_InitStructure.USART_Parity = USART_Parity_No;             // 无校验
+    USART_InitStructure.USART_HardwareFlowControl = USART_HardwareFlowControl_None; // 无硬件流控
+    USART_InitStructure.USART_Mode = USART_Mode_Tx | USART_Mode_Rx; //使能 RX 和 TX
+
+    USART_Init(UART6, &USART_InitStructure);
+    USART_ITConfig(UART6, USART_IT_RXNE, ENABLE);//////////////////////////////////////////////
+    NVIC_InitStructure.NVIC_IRQChannel = UART6_IRQn;////////////////////////////////
+    NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;///////////////////
+    NVIC_InitStructure.NVIC_IRQChannelSubPriority = 1;//////////////////////
+    NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;////////////////////
+    NVIC_Init(&NVIC_InitStructure);///////////////////////////////////
+    DMA_Cmd(DMA2_Channel7, ENABLE);                                  //开启接收 DMA
+    USART_Cmd(UART6, ENABLE);                                        //开启UART
+}
+
+/*******************************************************************************
+* Function Name  : DMA_INIT
+* Description    : Configures the DMA.
+* 描述    ：   DMA 初始化
+* Input          : None
+* Return         : None
+*******************************************************************************/
+void DMA_INIT(void)
+{
+    DMA_InitTypeDef DMA_InitStructure;
+    RCC_AHBPeriphClockCmd(RCC_AHBPeriph_DMA2, ENABLE);
+
+    // TX DMA 初始化
+    DMA_DeInit(DMA2_Channel6);
+    DMA_InitStructure.DMA_PeripheralBaseAddr = (u32)(&UART6->DATAR);        // DMA 外设基址，需指向对应的外设
+    DMA_InitStructure.DMA_MemoryBaseAddr = (u32)TxBuffer;                   // DMA 内存基址，指向发送缓冲区的首地址
+    DMA_InitStructure.DMA_DIR = DMA_DIR_PeripheralDST;                      // 方向 : 外设 作为 终点，即 内存 ->  外设
+    DMA_InitStructure.DMA_BufferSize = 0;                                   // 缓冲区大小,即要DMA发送的数据长度,目前没有数据可发
+    DMA_InitStructure.DMA_PeripheralInc = DMA_PeripheralInc_Disable;        // 外设地址自增，禁用
+    DMA_InitStructure.DMA_MemoryInc = DMA_MemoryInc_Enable;                 // 内存地址自增，启用
+    DMA_InitStructure.DMA_PeripheralDataSize = DMA_PeripheralDataSize_Byte; // 外设数据位宽，8位(Byte)
+    DMA_InitStructure.DMA_MemoryDataSize = DMA_MemoryDataSize_Byte;         // 内存数据位宽，8位(Byte)
+    DMA_InitStructure.DMA_Mode = DMA_Mode_Normal;                           // 普通模式，发完结束，不循环发送
+    DMA_InitStructure.DMA_Priority = DMA_Priority_VeryHigh;                 // 优先级最高
+    DMA_InitStructure.DMA_M2M = DMA_M2M_Disable;                            // M2P,禁用M2M
+    DMA_Init(DMA2_Channel6, &DMA_InitStructure);
+
+    // RX DMA 初始化，环形缓冲区自动接收
+    DMA_InitStructure.DMA_MemoryBaseAddr = (u32)RxBuffer;                   // 接收缓冲区
+    DMA_InitStructure.DMA_DIR = DMA_DIR_PeripheralSRC;                      // 方向 : 外设 作为 源，即 内存 <- 外设
+    DMA_InitStructure.DMA_BufferSize = RXBUF_SIZE;                          // 缓冲区长度为 RXBUF_SIZE
+    DMA_InitStructure.DMA_Mode = DMA_Mode_Circular;                         // 循环模式，构成环形缓冲区
+    DMA_Init(DMA2_Channel7, &DMA_InitStructure);
+}
+
+
+
+/*******************************************************************************
+* Function Name  :  uartWriteWiFi
+* Description    :  send data to ESP8266 via UART6
+* 描述    ：   向 WiFi 模组发送数据
+* Input          :  char * data          data to send   要发送的数据的首地址
+*                   uint16_t num         number of data 数据长度
+* Return         :  RESET                UART6 busy,failed to send  发送失败
+*                   SET                  send success               发送成功
+*******************************************************************************/
+FlagStatus uartWriteWiFi(char * data , uint16_t num)
+{
+    //如上次发送未完成，返回
+    if(DMA_GetCurrDataCounter(DMA2_Channel6) != 0){
+        return RESET;
+    }
+
+    DMA_ClearFlag(DMA2_FLAG_TC8);
+    DMA_Cmd(DMA2_Channel6, DISABLE );           // 关 DMA 后操作
+    DMA2_Channel6->MADDR = (uint32_t)data;      // 发送缓冲区为 data
+    DMA_SetCurrDataCounter(DMA2_Channel6,num);  // 设置缓冲区长度
+    DMA_Cmd(DMA2_Channel6, ENABLE);             // 开 DMA
+    return SET;
+}
+
+/*******************************************************************************
+* Function Name  :  uartWriteWiFiStr
+* Description    :  send string to ESP8266 via UART6    向 WiFi 模组发送字符串
+* Input          :  char * str          string to send
+* Return         :  RESET                UART busy,failed to send   发送失败
+*                   SET                  send success               发送成功
+*******************************************************************************/
+FlagStatus uartWriteWiFiStr(char * str)
+{
+    uint16_t num = 0;
+    while(str[num])num++;           // 计算字符串长度
+    return uartWriteWiFi(str,num);
+}
+
+
+/*******************************************************************************
+* Function Name  :  uartReadWiFireceive
+* Description    :  read some bytes from receive buffer 从接收缓冲区读出一组数据
+* Input          :  char * buffer        buffer to storage the data 用来存放读出数据的地址
+*                   uint16_t num         number of data to read     要读的字节数
+* Return         :  int                  number of bytes read       返回实际读出的字节数
+*******************************************************************************/
+uint16_t rxBufferReadPos = 0;       //接收缓冲区读指针
+uint32_t uartReadWiFi(char * buffer , uint16_t num)
+{
+    uint16_t rxBufferEnd = RXBUF_SIZE - DMA_GetCurrDataCounter(DMA2_Channel7); //计算 DMA 数据尾的位置
+    uint16_t i = 0;
+    if (rxBufferReadPos == rxBufferEnd){
+        // 无数据，返回
+        return 0;
+    }
+
+    while (rxBufferReadPos!=rxBufferEnd && i < num){
+        buffer[i] = RxBuffer[rxBufferReadPos];
+        i++;
+        rxBufferReadPos++;
+        if(rxBufferReadPos >= RXBUF_SIZE){
+            // 超出缓冲区，回零
+            rxBufferReadPos = 0;
+        }
+    }
+    return i;
+}
+
+/*******************************************************************************
+* Function Name  :  uartReadByteWiFi
+* Description    :  read one byte from UART buffer  从接收缓冲区读出 1 字节数据
+* Input          :  None
+* Return         :  char    read data               返回读出的数据(无数据也返回0)
+*******************************************************************************/
+char uartReadByteWiFi()
+{
+    char ret;
+    uint16_t rxBufferEnd = RXBUF_SIZE - DMA_GetCurrDataCounter(DMA2_Channel7);
+    if (rxBufferReadPos == rxBufferEnd){
+        // 无数据，返回
+        return 0;
+    }
+    ret = RxBuffer[rxBufferReadPos];
+    rxBufferReadPos++;
+    if(rxBufferReadPos >= RXBUF_SIZE){
+        // 超出缓冲区，回零
+        rxBufferReadPos = 0;
+    }
+    return ret;
+}
+/*******************************************************************************
+* Function Name  :  uartAvailableWiFi
+* Description    :  get number of bytes Available to read from the UART buffer  获取缓冲区中可读数据的数量
+* Input          :  None
+* Return         :  uint16_t    number of bytes Available to read               返回可读数据数量
+*******************************************************************************/
+uint16_t uartAvailableWiFi()
+{
+    uint16_t rxBufferEnd = RXBUF_SIZE - DMA_GetCurrDataCounter(DMA2_Channel7);//计算 DMA 数据尾的位置
+    // 计算可读字节
+    if (rxBufferReadPos <= rxBufferEnd){
+        return rxBufferEnd - rxBufferReadPos;
+    }else{
+        return rxBufferEnd +RXBUF_SIZE -rxBufferReadPos;
+    }
+}
+
+
+
+
+void GPIO_LED_INIT(void)
+{
+    GPIO_InitTypeDef GPIO_InitStructure = {0};
+
+    RCC_APB2PeriphClockCmd(RCC_APB2Periph_GPIOD, ENABLE);
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_8 | GPIO_Pin_11;
+    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_Out_PP;
+    GPIO_InitStructure.GPIO_Speed = GPIO_Speed_50MHz;
+    GPIO_Init(GPIOD, &GPIO_InitStructure);
+    GPIO_SetBits(GPIOD,GPIO_Pin_8 | GPIO_Pin_11);
+//    GPIO_ResetBits(GPIOD,GPIO_Pin_8 | GPIO_Pin_11);
+}
+/*******************************************************************************
+* Function Name  : main
+* Description    : Main program.
+* Input          : None
+* Return         : None
+*******************************************************************************/
+void EXTI_INT_INIT(void)
+{
+  GPIO_InitTypeDef  GPIO_InitStructure;
+    EXTI_InitTypeDef EXTI_InitStructure;
+    NVIC_InitTypeDef NVIC_InitStructure;
+
+  RCC_APB2PeriphClockCmd(RCC_APB2Periph_AFIO|RCC_APB2Periph_GPIOD|RCC_APB2Periph_GPIOE,ENABLE);
+
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_1|GPIO_Pin_2|GPIO_Pin_3|GPIO_Pin_4|GPIO_Pin_5;
+  GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
+  GPIO_Init(GPIOE, &GPIO_InitStructure);
+
+//  GPIO_InitStructure.GPIO_Pin = GPIO_Pin_0;
+//    GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
+//    GPIO_Init(GPIOA, &GPIO_InitStructure);
+
+    GPIO_InitStructure.GPIO_Pin = GPIO_Pin_6|GPIO_Pin_13;
+      GPIO_InitStructure.GPIO_Mode = GPIO_Mode_IPU;
+      GPIO_Init(GPIOD, &GPIO_InitStructure);
+
+
+
+//  GPIO_EXTILineConfig(GPIO_PortSourceGPIOA,GPIO_PinSource0);
+  GPIO_EXTILineConfig(GPIO_PortSourceGPIOE,GPIO_PinSource1);
+  GPIO_EXTILineConfig(GPIO_PortSourceGPIOE,GPIO_PinSource2);
+  GPIO_EXTILineConfig(GPIO_PortSourceGPIOE,GPIO_PinSource3);
+//  GPIO_EXTILineConfig(GPIO_PortSourceGPIOE,GPIO_PinSource4);
+//  GPIO_EXTILineConfig(GPIO_PortSourceGPIOE,GPIO_PinSource5);
+  GPIO_EXTILineConfig(GPIO_PortSourceGPIOD,GPIO_PinSource6);
+  GPIO_EXTILineConfig(GPIO_PortSourceGPIOD,GPIO_PinSource13);
+
+
+//  EXTI_InitStructure.EXTI_Line=EXTI_Line0|EXTI_Line1|EXTI_Line2|EXTI_Line3|EXTI_Line4|EXTI_Line5|EXTI_Line6|EXTI_Line13;
+  EXTI_InitStructure.EXTI_Line=EXTI_Line1|EXTI_Line2|EXTI_Line3|EXTI_Line6|EXTI_Line13;
+  EXTI_InitStructure.EXTI_Mode = EXTI_Mode_Interrupt;
+  EXTI_InitStructure.EXTI_Trigger = EXTI_Trigger_Falling;
+  EXTI_InitStructure.EXTI_LineCmd = ENABLE;
+  EXTI_Init(&EXTI_InitStructure);
+
+//    NVIC_InitStructure.NVIC_IRQChannel = EXTI0_IRQn;
+    NVIC_InitStructure.NVIC_IRQChannel = EXTI1_IRQn;
+  NVIC_InitStructure.NVIC_IRQChannelPreemptionPriority = 1;
+  NVIC_InitStructure.NVIC_IRQChannelSubPriority = 2;
+  NVIC_InitStructure.NVIC_IRQChannelCmd = ENABLE;
+  NVIC_Init(&NVIC_InitStructure);
+
+//  NVIC_InitStructure.NVIC_IRQChannel = EXTI1_IRQn;
+//    NVIC_Init(&NVIC_InitStructure);
+
+  NVIC_InitStructure.NVIC_IRQChannel = EXTI2_IRQn;
+    NVIC_Init(&NVIC_InitStructure);
+
+  NVIC_InitStructure.NVIC_IRQChannel = EXTI3_IRQn;
+  NVIC_Init(&NVIC_InitStructure);
+
+//  NVIC_InitStructure.NVIC_IRQChannel = EXTI4_IRQn;
+//    NVIC_Init(&NVIC_InitStructure);
+
+  NVIC_InitStructure.NVIC_IRQChannel = EXTI9_5_IRQn;
+  NVIC_Init(&NVIC_InitStructure);
+
+  NVIC_InitStructure.NVIC_IRQChannel = EXTI15_10_IRQn;
+    NVIC_Init(&NVIC_InitStructure);
+}
+
+int8_t key_count;
+int8_t sign;
+void key_detect(int8_t key)
+{
+    if(key==0)
+    {
+        lcd_clear(BLACK);
+        lcd_set_color(BLACK,WHITE);
+        lcd_show_string(0, 20, 32,"Monitor :");
+        lcd_set_color(BLACK,GREEN);
+        lcd_show_string(0, 70, 24,"Temperature:");
+        lcd_show_string(0, 102, 24,"Humidity   :");
+        lcd_show_string(0, 134, 24,"PPM     :");
+    //  lcd_set_color(BLACK,YELLOW);
+        lcd_show_string(180, 70, 24,"CEL");
+        lcd_show_string(180, 102, 24,"Per");
+        lcd_show_string(180, 134, 24,"Per");
+        lcd_show_string(180, 134, 24,"Per");
+    }
+    else if (key_count==1)
+    {
+        lcd_clear(WHITE);
+        lcd_set_color(WHITE,BLACK);
+        lcd_show_string(0, 20, 24,"is there anybody..");
+        lcd_show_string(0, 90, 24,"LED condition:");
+        lcd_show_string(20, 120, 32,"LED1    LED2");
+        lcd_show_string(20, 190, 32,"Door:");
+    }
+}
+
+void sign_detect(int8_t sig)
+{
+    if(sig==0)
+    {
+        lcd_fill(170,175,195,185,WHITE);
+        lcd_fill(40,175,65,185,WHITE);
+        lcd_fill(130,225,155,235,WHITE);
+    }
+    else if(sig==1)
+    {
+        lcd_fill(170,175,195,185,WHITE);
+//        FORE_COLOR = BLUE;
+        lcd_fill(40,175,65,185,BLUE);
+    }
+    else if (sig==2)
+    {
+        lcd_fill(40,175,65,185,WHITE);
+        lcd_fill(170,175,195,185,BLUE);
+        lcd_fill(130,225,155,235,WHITE);
+    }
+    else if(sign==3)
+    {
+        lcd_fill(170,175,195,185,WHITE);
+        lcd_fill(130,225,155,235,BLUE);
+    }
+}
+
+u8 LED1,LED2;
+int main(void)
+{
+    int tempreture;
+    char buff[256];//esp8266发送AT指令缓存
+    u8 i=0;
+    u8 stat=0;
+    u16 tp1,tp2,tp3,tp4,temp,Vrl;
+    float ppm,V;
+    NVIC_PriorityGroupConfig(NVIC_PriorityGroup_2);
+
+    /*
+     * 五项开关初始化
+     */
+    EXTI_INT_INIT();
+
+    Delay_Init();
+    USART_Printf_Init(115200);
+    USART2_Printf_Init(9600);
+    EXTI_Key_Config();
+//  EXTI3_INT_INIT();
+    /*****
+     * ADC_INIT
+     */
+    ADC_Function_Init();
+    DMA_Tx_Init( DMA1_Channel1, (u32)&ADC1->RDATAR, (u32)TxBuf, 1024 );
+    DMA_Cmd( DMA1_Channel1, ENABLE );
+    ADC_RegularChannelConfig(ADC1, ADC_Channel_1, 1, ADC_SampleTime_239Cycles5 );
+    ADC_SoftwareStartConvCmd(ADC1, ENABLE);
+    Delay_Ms(50);
+    ADC_SoftwareStartConvCmd(ADC1, DISABLE);
+
+
+    printf("SystemClk:%d\r\n",SystemCoreClock);
+    /***********************************
+     * lcd_init
+     */
+
+    lcd_init();
+    lcd_set_color(BLACK,WHITE);
+    lcd_show_string(0, 20, 32,"Monitor :");
+    lcd_set_color(BLACK,GREEN);
+    lcd_show_string(0, 70, 24,"Temperature:");
+    lcd_show_string(0, 102, 24,"Humidity   :");
+    lcd_show_string(0, 134, 24,"PPM     :");
+
+//  lcd_set_color(BLACK,YELLOW);
+    lcd_show_string(180, 70, 24,"CEL");
+    lcd_show_string(180, 102, 24,"Per");
+    lcd_show_string(180, 134, 24,"Per");
+    lcd_show_string(180, 134, 24,"Per");
+    while(AHT10_Init())         //初始化AHT10
+    {
+        printf("AHT10 Error");
+        lcd_set_color(BLACK,RED);
+        lcd_show_string(180, 176, 16,"Error");
+        Delay_Ms(200);
+        lcd_show_string(180, 176, 16,"     ");
+        Delay_Ms(200);
+    }
+    Delay_Ms(2000);
+    /****************************/
+    printf("8266 WiFi TEST\r\n");
+
+    DMA_INIT();
+    USARTx_CFG();                                                 /* USART INIT */
+    USART_DMACmd(UART6,USART_DMAReq_Tx|USART_DMAReq_Rx,ENABLE);
+
+
+    Delay_Ms(1000);
+    // 查询 WiFi 模块是否正常工作
+    uartWriteWiFi("AT\r\n",4);
+    Delay_Ms(100);
+    // 查询 WiFi 模块版本信息
+    while(uartWriteWiFi("AT+GMR\r\n",8)==RESET);
+    Delay_Ms(100);
+    // 查询模块支持的 AT 命令，一些模块不支持此指令
+//    while(uartWriteWiFi("AT+CMD\r\n",8)==RESET);
+//    Delay_Ms(100);
+    // 设为 Station 模式
+    while(uartWriteWiFiStr("AT+CWMODE=1\r\n")==RESET);
+    Delay_Ms(100);
+    // 连接一个名为 SSID、密码为 PASSWORD 的 WiFi 网络，
+    while(uartWriteWiFiStr("AT+CWJAP=\"chong\",\"huang098123\"\r\n")==RESET);//连接热点
+    Delay_Ms(100);
+
+//    /********新添加
+//     * 设置单连接
+//     */
+//    while(uartWriteWiFiStr("AT+CIPMUX=0")==RESET);
+//    Delay_Ms(100);
+
+
+    //打印之前收到的信息
+    int num = uartAvailableWiFi();
+    if (num > 0 ){
+        char buffer[1024]={"\0"};
+        uartReadWiFi(buffer , num);
+        printf("Revceived:\r\n%s",buffer);
+    }
+
+    //等待后续回复
+    while(uartAvailableWiFi()==0);
+    Delay_Ms(2000);
+    num = uartAvailableWiFi();
+    if (num > 0 ){
+        char buffer[1024]={"\0"};
+        uartReadWiFi(buffer , num);
+        printf("Revceived:\r\n%s",buffer);
+    }
+    Delay_Ms(2000);
+    //连接服务器
+//    while(uartWriteWiFiStr("AT+CIPSTART=\"TCP\",\"192.168.43.8\",8081\r\n")==RESET);//连接服务端以及开放的端口
+//    Delay_Ms(100);
+
+
+
+
+
+/******************************************************************************************************************
+ *
+ * AT+MQTT接入阿里云
+ *
+ *
+ *
+ */
+    while(uartWriteWiFiStr("AT+CIPSNTPCFG=1,8,\"ntp1.aliyun.com\"\r\n")==RESET);//连接阿里云服务端
+    Delay_Ms(500);
+
+    num = uartAvailableWiFi();
+    printf("1");
+                   if (num > 0 ){
+                       char buffer[1024]={"\0"};
+                       uartReadWiFi(buffer , num);
+                       printf("Revceived:\r\n%s",buffer);
+                   }
+
+
+    while(uartWriteWiFiStr("AT+MQTTUSERCFG=0,1,\"\",\"\",\"\",0,0,\"\"\r\n")==RESET);//设置MQTT用户配置
+    Delay_Ms(500);
+    printf("2");
+    num = uartAvailableWiFi();
+                   if (num > 0 ){
+                       char buffer[1024]={"\0"};
+                       uartReadWiFi(buffer , num);
+                       printf("Revceived:\r\n%s",buffer);
+                   }
+
+    while(uartWriteWiFiStr("AT+MQTTUSERNAME=0,\"AHT10.LED&h92leBgFAn5\"\r\n")==RESET);//设置MQTT用户名
+    Delay_Ms(500);
+    printf("3");
+    num = uartAvailableWiFi();
+               if (num > 0 ){
+                   char buffer[1024]={"\0"};
+                   uartReadWiFi(buffer , num);
+                   printf("Revceived:\r\n%s",buffer);
+               }
+
+    while(uartWriteWiFiStr("AT+MQTTPASSWORD=0,\"7b093444c0069424583afda24a18f1d3c439d48ff06561ea949f7b264422d1e8\"\r\n")==RESET);//设置MQTT密码
+    Delay_Ms(500);
+    printf("4");
+    num = uartAvailableWiFi();
+                   if (num > 0 ){
+                       char buffer[1024]={"\0"};
+                       uartReadWiFi(buffer , num);
+                       printf("Revceived:\r\n%s",buffer);
+                   }
+
+    while(uartWriteWiFiStr("AT+MQTTCLIENTID=0,\"h92leBgFAn5.AHT10.LED|securemode=2\\\,signmethod=hmacsha256\\\,timestamp=1657093535232|\"\r\n")==RESET);//设置MQTT客户端ID
+        Delay_Ms(500);
+
+        printf("5");
+        num = uartAvailableWiFi();
+                   if (num > 0 ){
+                       char buffer[1024]={"\0"};
+                       uartReadWiFi(buffer , num);
+                       printf("Revceived:\r\n%s",buffer);
+                   }
+
+    while(uartWriteWiFiStr("AT+MQTTCONN=0,\"h92leBgFAn5.iot-as-mqtt.cn-shanghai.aliyuncs.com\",1883,1\r\n")==RESET);//连接到MQTT Broker
+      Delay_Ms(2000);
+      printf("6");
+      num = uartAvailableWiFi();
+                     if (num > 0 ){
+                         char buffer[1024]={"\0"};
+                         uartReadWiFi(buffer , num);
+                         printf("Revceived:\r\n%s",buffer);
+                     }
+                     //等待后续回复
+//                     while(uartAvailableWiFi()==0);
+//                     Delay_Ms(200);
+//                     num = uartAvailableWiFi();
+//                     if (num > 0 ){
+//                         char buffer[1024]={"\0"};
+//                         uartReadWiFi(buffer , num);
+//                         printf("Revceived:\r\n%s",buffer);
+//                     }
+//                     Delay_Ms(200);
+
+    while(uartWriteWiFiStr("AT+MQTTSUB=0,\"/sys/h92leBgFAn5/AHT10.LED/thing/service/property/set\",1\r\n")==RESET);//订阅MQTT主题
+      Delay_Ms(1000);
+      printf("7");
+      num = uartAvailableWiFi();
+                     if (num > 0 ){
+                         char buffer[1024]={"\0"};
+                         uartReadWiFi(buffer , num);
+                         printf("Revceived:\r\n%s",buffer);
+                     }
+
+    GPIO_LED_INIT();
+    tim_Init();         //1s定时控制舵机
+    TIM3_PWMOut_Init( 500-1 , 2880-1, 10 );   //Tout = （（arr+1）（psc+1））/Tclk    72000000
+//    EXTI3_INT_INIT();
+    Delay_Ms(4000);
+    char *res;
+    char *res1;
+    Receive_sum = 0;
+    for (unsigned int ii = 0; ii < strlen(USART_ReceiveString); ii++)
+       USART_ReceiveString[ii]='\0';
+
+
+    lcd_set_color(BLACK,YELLOW);
+    while(1)
+    {
+//        if( !GPIO_ReadOutputDataBit(GPIOD, GPIO_Pin_8 ))
+//            LED1=1;
+//        else
+//            LED1=0;
+//        if( !GPIO_ReadOutputDataBit(GPIOD, GPIO_Pin_10 ))
+//            LED2=1;
+//        else
+//            LED2=0;
+
+
+        Read_D9_Handle();       //读取K210引脚A11判断房间是否无人
+        Read_D3_Handle();       //读取K210引脚A10判断是否识别到人脸
+//        Read_D10_Handle();      //读取LD3320引脚判断小马是否识别
+//        printf("demo1%c%c\r\n",wendu[0],wendu[1]);
+//        printf("demo2%s\r\n",shidu[0]);
+        temp =  Get_ADC_Val(ADC_Channel_1);
+///////////////////////////////        printf( "%04d\r\n", temp);
+        Vrl = 3300*temp/4096;
+        tp1 = Vrl/1000;     //取千位
+        tp2 = Vrl/100%10;   //取百位
+        tp3 = Vrl/10%10;   //取十位
+        tp4 = Vrl%10;   //取个位
+
+        printf("volt:%d.%d%d%d V\r\n",tp1,tp2,tp3,tp4);
+        itoa(temp, str1, 10);
+        strcat(str1,"<-volt\r\n");
+        while(uartWriteWiFiStr(str1)==RESET);
+        V = (float)Vrl/1000.0;
+        ppm = pow(11.5428 * 35.904 * V/(25.5-5.1* V),0.6549);
+        if(ppm>=10)
+        {
+            Usartx_SendData(USART2,ppm_call,strlen(ppm_call));
+            TIM_SetCompare3(TIM1, 60);
+            Delay_Ms(1500);
+        }
+        tp3 = (int)ppm/10%10;   //取十位
+        tp4 = (int)ppm%10;   //取个位
+        printf("ppm: %d%d \%\r\n",tp3,tp4);
+
+
+        temperature = AHT10_Read_Temperature();
+        itoa(temperature, str1, 10);
+        strcat(str1,"<-temp\r\n");
+        while(uartWriteWiFiStr(str1)==RESET);
+
+        humidity = AHT10_Read_Humidity();
+        itoa(humidity, str1, 10);
+        strcat(str1,"<-hum\r\n");
+        while(uartWriteWiFiStr(str1)==RESET);
+
+///////////////////////////////////设备到云平台消息
+        bzero(buff, sizeof(buff));
+//        buff[i]='\0';
+        /*
+         * 1
+         */
+//        snprintf(buff,sizeof(buff),"AT+MQTTPUB=0,\"/sys/h92leBgFAn5/AHT10.LED/thing/event/property/post\",\"{\\\"id\\\":1652883501797\\\,\\\"params\\\":{\\\"RoomTemp\\\":%d\\\,\\\"RoomHumidity\\\":%d\\\,\\\"LED1light\\\":%d\\\,\\\"LED2light\\\":%d\\\,\\\"MQ2Gas\\\":%d}\\\,\\\"version\\\":\\\"1.0\\\"\\\,\\\"method\\\":\\\"thing.event.property.post\\\"}\",1,0\r\n",(int)temperature,(int)humidity,(int)LED1,(int)LED2,(int)ppm);
+        delay_ms(500);
+        //        snprintf(buff,sizeof(buff),"AT+MQTTPUB=0,\"/sys/h92leBgFAn5/AHT10.LED/thing/event/property/post\",\"{\\\"id\\\":1652883501797\\\,\\\"params\\\":{\\\"RoomTemp\\\":%d\\\,\\\"RoomHumidity\\\":%d}\\\,\\\"version\\\":\\\"1.0\\\"\\\,\\\"method\\\":\\\"thing.event.property.post\\\"}\",1,0\r\n",(int)temperature,(int)humidity);
+       /*
+        * 2
+        */
+        snprintf(buff,sizeof(buff),"AT+MQTTPUB=0,\"/sys/h92leBgFAn5/AHT10.LED/thing/event/property/post\",\"{\\\"id\\\":1652883501797\\\,\\\"params\\\":{\\\"RoomTemp\\\":%d\\\,\\\"RoomHumidity\\\":%d\\\,\\\"MQ2Gas\\\":%d}\\\,\\\"version\\\":\\\"1.0\\\"\\\,\\\"method\\\":\\\"thing.event.property.post\\\"}\",1,0\r\n",(int)temperature,(int)humidity,(int)ppm);
+        /*
+          * 上行调试指令publish topic=/sys/h92leBgFAn5/AHT10.LED/thing/event/property/post, payload={"id":1654152545063,"params":{"RoomHumidity":14,"RoomTemp":14,"LED1light":1,"LED2light":1},"version":"1.0","method":"thing.event.property.post"}
+          * publish topic=/sys/h92leBgFAn5/AHT10.LED/thing/event/property/post, payload={"id":1656230306552,"params":{"RoomHumidity":3,"RoomTemp":5,"LED1light":0,"LED2light":0,"MQ2Gas":22},"version":"1.0","method":"thing.event.property.post"}
+         */
+//        printf("9");printf(buff);
+        while(uartWriteWiFiStr(buff)==RESET);
+
+
+        tempreture = (int)temperature;
+//        tempreture /=10;
+        temp=(int)ppm;
+        if(key_count==0)
+        {
+            lcd_set_color(BLACK,YELLOW);
+            lcd_show_string(145, 70, 24,"%d", tempreture);
+            lcd_show_string(145, 102, 24,"%d", (int)humidity);
+            lcd_show_string(145, 134, 24,"%d", temp);
+            Delay_Ms(1000);
+        }
+        else if (key_count==1)
+        {
+            if(anbody)
+            {
+                lcd_set_color(WHITE,GREEN);
+                lcd_show_string(20, 50, 32, "YES!");
+            }
+            else
+            {
+                lcd_set_color(WHITE,RED);
+                lcd_show_string(20, 50, 32, "NO !");
+            }
+
+            if(LED1)
+            {
+                lcd_fill(25, 150, 80, 170, GREEN);
+            }
+            else if(!LED1)
+            {
+                lcd_fill(25, 150, 80, 170, RED);
+            }
+
+            if(LED2)
+            {
+                lcd_fill(155, 150, 210, 170, GREEN);
+            }
+            else if(!LED2)
+            {
+                lcd_fill(155, 150, 210, 170, RED);
+            }
+
+            if(zs==10)
+            {
+                lcd_fill(115, 200, 170, 220, GREEN);
+                lcd_set_color(WHITE,GREEN);
+                lcd_show_string(172, 200, 24, "close");
+            }
+            else if(zs==60)
+            {
+                lcd_fill(115, 200, 170, 220, RED);
+                lcd_set_color(WHITE,RED);
+                lcd_show_string(172, 200, 24, "open!");
+            }
+        }
+
+
+         num = uartAvailableWiFi();
+         if (num > 0 )
+         {
+             char buffer[1024]={"\0"};
+             uartReadWiFi(buffer , num);
+             res=strstr(buffer,"LED1light");
+             res1=strstr(buffer,"LED2light");
+             if(res)
+             {
+    ///////////////////////////////////    printf("led1:%c\r\n",buffer[res-buffer+11]);
+    //                                     printf("Rev:%c\r\n",res[11]);    //这两种方法可以得到led1的值
+                 if(res[11]=='0')   //云端0表示关闭，1表示开启
+                 {
+                     GPIO_ResetBits(GPIOD,GPIO_Pin_8); //LED1关闭
+                     LED1=0;        //设备发送LED信息给云端
+                 }
+                 else if(res[11]=='1')
+                 {
+                     GPIO_SetBits(GPIOD,GPIO_Pin_8); //LED1开启
+                     LED1=1;
+                 }
+             }
+             if(res1)
+             {
+    /////////////////////////////////       printf("led2:%c\r\n",buffer[res1-buffer+11]);
+             //     printf("Rev:%c\r\n",res[17]);    //这两种方法可以得到led2的值
+                 if(res1[11]=='0')   //云端0表示关闭，1表示开启
+                 {
+                     GPIO_ResetBits(GPIOD,GPIO_Pin_11); //LED1关闭
+                     LED2=0;        //设备发送LED信息给云端
+                 }
+                 else if(res1[11]=='1')
+                 {
+                    GPIO_SetBits(GPIOD,GPIO_Pin_11); //LED1开启
+                    LED2=1;        //设备发送LED信息给云端
+                 }
+             }
+    //                                 else
+    //                                       printf("led2 Not Found!\r\n");
+    ///////////////////////                                 printf("Revceived:\r\n%s",buffer);
+         }
+    }
+}
+
+
+
+void EXTI1_IRQHandler(void)
+{
+  if(EXTI_GetITStatus(EXTI_Line1)!=RESET)
+  {
+    printf("UP !\r\n");
+    if(key_count==1)
+        sign--;
+    if(sign==-1)
+        sign=3;
+    sign_detect(sign);
+    EXTI_ClearITPendingBit(EXTI_Line1);     /* Clear Flag */
+  }
+}
+
+void EXTI2_IRQHandler(void)
+{
+  if(EXTI_GetITStatus(EXTI_Line2)!=RESET)
+  {
+    printf("DOWN !\r\n");
+    if(key_count==1)
+        sign++;
+    if(sign==4)
+        sign=0;
+    sign_detect(sign);
+    EXTI_ClearITPendingBit(EXTI_Line2);     /* Clear Flag */
+  }
+}
+
+void EXTI3_IRQHandler(void)
+{
+  if(EXTI_GetITStatus(EXTI_Line3)!=RESET)
+  {
+    printf("RIGHT !\r\n");
+    key_count++;
+    if(key_count==2)
+        key_count=0;
+    key_detect(key_count);
+    EXTI_ClearITPendingBit(EXTI_Line3);     /* Clear Flag */
+  }
+}
+
+void EXTI9_5_IRQHandler(void)
+{
+  if(EXTI_GetITStatus(EXTI_Line6)!=RESET)
+  {
+    printf("LEFT !\r\n");
+    key_count--;
+    if(key_count==-1)
+        key_count=1;
+    key_detect(key_count);
+    EXTI_ClearITPendingBit(EXTI_Line6);     /* Clear Flag */
+  }
+}
+
+void EXTI15_10_IRQHandler(void)
+{
+  if(EXTI_GetITStatus(EXTI_Line13)!=RESET)
+  {
+    printf("SEL !\r\n");
+    if(sign==1)
+    {
+        if (LED1)
+        {
+            GPIO_ResetBits(GPIOD,GPIO_Pin_8);
+            LED1=0;
+        }
+        else if (!LED1){
+            GPIO_SetBits(GPIOD,GPIO_Pin_8);
+            LED1=1;
+        }
+    }
+    if(sign==2)
+    {
+        if (LED2)
+        {
+            GPIO_ResetBits(GPIOD,GPIO_Pin_11);
+            LED2=0;
+        }
+        else if (!LED2){
+            GPIO_SetBits(GPIOD,GPIO_Pin_11);
+            LED2=1;
+        }
+    }
+    if(sign==3)
+    {
+        if (zs==10) {
+            zs=60;
+            TIM_SetCompare3(TIM3, zs);
+        }
+        else
+        {
+            zs=10;
+            TIM_SetCompare3(TIM3, zs);
+        }
+    }
+    EXTI_ClearITPendingBit(EXTI_Line13);     /* Clear Flag */
+  }
+}
